@@ -1,8 +1,8 @@
 import streamlit as st
 import os
 from dotenv import load_dotenv
-from search import search_arxiv, MOCK_PAPERS
-from gemini_llm import init_gemini, get_synthesized_answer, evaluate_novelty, process_chat_message
+from search import execute_agent_search, MOCK_PAPERS
+from gemini_llm import init_gemini, get_synthesized_answer, evaluate_novelty, process_chat_message, generate_search_plan
 from datetime import datetime
 
 # Load env variables
@@ -57,8 +57,12 @@ if "query" not in st.session_state:
     st.session_state.query = ""
 if "papers" not in st.session_state:
     st.session_state.papers = []
-if "use_real_search" not in st.session_state:
-    st.session_state.use_real_search = False
+if "selected_sources" not in st.session_state:
+    st.session_state.selected_sources = ["Computation and Language (NLP)"]
+if "agent_queries" not in st.session_state:
+    st.session_state.agent_queries = []
+if "agent_categories" not in st.session_state:
+    st.session_state.agent_categories = []
 if "synthesis" not in st.session_state:
     st.session_state.synthesis = []
 if "chat_history" not in st.session_state:
@@ -66,22 +70,47 @@ if "chat_history" not in st.session_state:
 if "novelty_result" not in st.session_state:
     st.session_state.novelty_result = None
 
+AVAILABLE_CATEGORIES = {
+    "Computation and Language (NLP)": "cs.CL",
+    "Artificial Intelligence": "cs.AI",
+    "Machine Learning": "cs.LG",
+    "Computer Vision": "cs.CV",
+    "Quantitative Biology (Biomolecules)": "q-bio.BM",
+    "Genomics": "q-bio.GN",
+    "Physics": "physics.comp-ph"
+}
+
 # --- Main Functions ---
 
 def trigger_search():
-    with st.spinner("Searching for related papers..."):
-        if st.session_state.use_real_search:
-            results = search_arxiv(st.session_state.query, max_results=5)
-            if results:
-                st.session_state.papers = results
-            else:
-                st.warning("No results from arXiv. Falling back to mock data.")
-                st.session_state.papers = MOCK_PAPERS
+    selected_cats = [AVAILABLE_CATEGORIES[k] for k in st.session_state.selected_sources]
+
+    with st.spinner("Agent planning search..."):
+        plan = generate_search_plan(st.session_state.query, selected_cats)
+        
+        if plan.get("status") == "needs_clarification":
+            st.session_state.chat_history.append({
+                "role": "assistant", 
+                "text": plan.get("clarifying_question", "Can you please clarify your request?"), 
+                "timestamp": "now"
+            })
+            st.warning("Agent requires clarification. Please reply in the Research Thread.")
+            return
+
+        queries = plan.get("queries", [st.session_state.query])
+        categories = plan.get("categories", selected_cats)
+        
+        st.session_state.agent_queries = queries
+        st.session_state.agent_categories = categories
+
+    with st.spinner(f"Executing targeted searches across {', '.join(categories)}..."):
+        results = execute_agent_search(queries, categories, max_results_per_query=3)
+        if results:
+            st.session_state.papers = results
+            trigger_synthesis(trigger_reason="Agentic Context Search")
         else:
-            st.session_state.papers = MOCK_PAPERS
-            
-    # Trigger Synthesis automatically
-    trigger_synthesis(trigger_reason="Initial Context Search")
+            st.warning("No results from arXiv databases. Try a different query.")
+            st.session_state.papers = []
 
 def trigger_synthesis(trigger_reason="Initial Context Search"):
     with st.spinner("Synthesizing answer with Gemini..."):
@@ -103,16 +132,21 @@ def trigger_synthesis(trigger_reason="Initial Context Search"):
 # SIDEBAR (Process Panel)
 with st.sidebar:
     st.markdown("### Process Panel")
-    if not st.session_state.papers:
-        st.info("Awaiting user query...")
+    if not st.session_state.agent_queries:
+        st.info("Awaiting agent actions...")
     else:
-        st.caption("Agent Queries")
-        st.code(f"1. search(\"{st.session_state.query}\")", language="text")
-        st.code("2. filter(subject IN [\"cs.CL\"])", language="text")
+        st.markdown(f"**Selected Categories:** {', '.join(st.session_state.agent_categories)}")
+        st.caption("Agent Queries Executed")
+        for i, q in enumerate(st.session_state.agent_queries):
+            st.code(f"{i+1}. search(\"{q}\")", language="text")
+        
+        cat_str = '", "'.join(st.session_state.agent_categories)
+        if cat_str:
+            st.code(f"filter(category IN [\"{cat_str}\"])", language="text")
         
         st.divider()
         st.markdown("### Databases")
-        st.markdown(f"🟢 **arXiv cs.CL** ({len(st.session_state.papers)} sources fetched)")
+        st.markdown(f"🟢 **arXiv Automated** ({len(st.session_state.papers)} sources fetched)")
 
 # MAIN AREA
 
@@ -123,11 +157,16 @@ st.divider()
 
 # Search Bar Area
 with st.container():
-    col1, col2, col3 = st.columns([6, 2, 1])
+    col1, col2, col3 = st.columns([6, 3, 1])
     with col1:
-        st.session_state.query = st.text_input("Ask a research question...", value=st.session_state.query, label_visibility="collapsed")
+        st.text_input("Ask a research question...", key="query", label_visibility="collapsed", placeholder="e.g. Tell me about how MDLMs are used for molecule generation.")
     with col2:
-        st.session_state.use_real_search = st.toggle("Live arXiv Search", value=st.session_state.use_real_search, help="Toggle to fetch real data from arXiv instead of using mock data.")
+        st.multiselect(
+            "Data Sources",
+            options=list(AVAILABLE_CATEGORIES.keys()),
+            key="selected_sources",
+            label_visibility="collapsed"
+        )
     with col3:
         if st.button("Search", use_container_width=True):
             trigger_search()
@@ -160,7 +199,8 @@ with main_col:
         st.markdown("#### Retrieved Papers")
         for paper in st.session_state.papers:
             with st.container(border=True):
-                st.markdown(f"**{paper['title']}**")
+                url = paper.get('url', '#')
+                st.markdown(f"**[{paper['title']}]({url})**")
                 authors = paper.get('authors', '')
                 year = paper.get('year', '')
                 cites = paper.get('citations_mock', 'N/A')

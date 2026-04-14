@@ -54,34 +54,42 @@ MOCK_PAPERS = [
   }
 ]
 
-def search_arxiv(query: str, max_results: int = 10) -> List[Dict]:
-    """Search arxiv for papers in the cs.CL category."""
+def execute_agent_search(queries: List[str], categories: List[str], max_results_per_query: int = 3) -> List[Dict]:
+    """Search arxiv for multiple queries across multiple categories, returning deduplicated results."""
     client = arxiv.Client()
+    papers = []
+    seen_ids = set()
     
+    # Construct category string: (cat:cs.CL OR cat:q-bio.BM ...)
+    cat_str = ""
+    if categories:
+        cat_str = " AND (" + " OR ".join([f"cat:{c}" for c in categories]) + ")"
+        
     try:
-        # Enforce search within cs.CL (NLP)
-        search = arxiv.Search(
-            query=f'all:"{query}" AND cat:cs.CL',
-            max_results=max_results,
-            sort_by=arxiv.SortCriterion.Relevance
-        )
-        
-        results = list(client.results(search))
-        
-        papers = []
-        for r in results:
-            papers.append({
-                "id": r.get_short_id(),
-                "title": r.title,
-                "authors": ", ".join([a.name for a in r.authors]),
-                "year": r.published.year,
-                "published_date": r.published.strftime("%Y-%m-%d"),
-                "summary": r.summary,
-                "url": r.pdf_url,
-                "citations_mock": 0
-            })
+        for q in queries:
+            # Drop the exact match quotes so arXiv can match normally
+            search_str = f'({q}){cat_str}'
+            search = arxiv.Search(
+                query=search_str,
+                max_results=max_results_per_query,
+                sort_by=arxiv.SortCriterion.Relevance
+            )
             
-        return papers
+            for r in client.results(search):
+                short_id = r.get_short_id()
+                if short_id not in seen_ids:
+                    seen_ids.add(short_id)
+                    papers.append({
+                        "id": short_id,
+                        "title": r.title,
+                        "authors": ", ".join([a.name for a in r.authors]),
+                        "year": r.published.year,
+                        "published_date": r.published.strftime("%Y-%m-%d"),
+                        "summary": r.summary,
+                        "url": r.pdf_url,
+                        "citations_mock": 0
+                    })
     except Exception as e:
         print(f"Error fetching from arxiv: {e}")
-        return []
+        
+    return papers
