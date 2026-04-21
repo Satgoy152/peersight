@@ -11,6 +11,7 @@ def init_gemini():
 
 def generate_search_plan(query: str, allowed_categories: List[str]) -> Dict:
     """Uses Gemini to decide if it needs clarification or can generate searches/categories."""
+    print(f"[SYSTEM] Generating search plan for query: '{query}'")
     try:
         model = genai.GenerativeModel("gemini-3-flash-preview")
         
@@ -40,13 +41,16 @@ def generate_search_plan(query: str, allowed_categories: List[str]) -> Dict:
                 response_mime_type="application/json"
             )
         )
-        return json.loads(response.text)
+        plan = json.loads(response.text)
+        print(f"[SYSTEM] Search plan generated: {plan['status']}")
+        return plan
     except Exception as e:
-        print(f"Error in search plan: {e}")
+        print(f"[ERROR] Error in search plan: {e}")
         return {"status": "needs_clarification", "clarifying_question": "Sorry, I had an error analyzing your query. Can you please rephrase?"}
 
 def get_synthesized_answer(query: str, papers: List[Dict], chat_history: List[Dict] = None) -> str:
-    """Uses Gemini 1.5 Flash to synthesize an answer based on papers and chat history."""
+    """Uses Gemini 3 Flash Preview to synthesize an answer based on papers and chat history."""
+    print(f"[SYSTEM] Synthesizing answer using {len(papers)} papers...")
     try:
         model = genai.GenerativeModel("gemini-3-flash-preview")
         
@@ -62,19 +66,23 @@ def get_synthesized_answer(query: str, papers: List[Dict], chat_history: List[Di
                 
         prompt = f"""
         You are PeerSight, an expert AI Research Assistant specializing in NLP.
-        Synthesize a literature review answer to the following query: "{query}"
+        The user's core research topic is: "{query}"
         
-        Use mainly the provided paper summaries to inform your answer. 
-        Cite the papers in your text using the [Author Year] format.
-        Focus on answering how it compares to existing work.
-        Keep it concise (1-2 paragraphs).
+        Using the provided context papers and the conversation history, synthesize an evolving literature review.
+        
+        Guidelines for your synthesis:
+        1. The Core is Focal: Keep the user's original query as the central theme.
+        2. Evolving Thought: Treat the conversation history as an evolution of ideas. Add answers to new follow-ups by appending insights without eagerly deleting the original context.
+        3. Compress, Don't Drop: If you need to make room for new discoveries, compress older points rather than removing them entirely. Ensure previously established context remains available unless explicitly discarded by the user.
+        4. Length Limit: Your final synthesis must be at most 3 paragraphs long.
+        5. Citations: Always cite the papers in your text using the [Author Year] format.
         
         Context Papers:
         {context}
         
         {history_context}
         
-        Provide a succinct synthesized overview focusing on consensus, conflicting findings, and identifying gaps.
+        Provide a succinct synthesized overview focusing on consensus, conflicting findings, and identifying gaps while adhering to the guidelines.
         """
         
         response = model.generate_content(prompt)
@@ -82,31 +90,41 @@ def get_synthesized_answer(query: str, papers: List[Dict], chat_history: List[Di
     except Exception as e:
         return f"Error connecting to Gemini API: {e}\n\nPlease make sure your GEMINI_API_KEY is correctly set in the .env file."
 
-def evaluate_novelty(idea: str, papers: List[Dict]) -> Dict:
-    """Evaluates the novelty of a given idea compared to retrieved papers."""
+def rate_papers(query: str, papers: List[Dict]) -> List[Dict]:
+    """Evaluates and rates a list of papers based on relevance, quality, and recency."""
+    if not papers:
+        print("[SYSTEM] No papers to rate.")
+        return []
+    print(f"[SYSTEM] Rating {len(papers)} papers based on query: '{query}'")
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-3-flash-preview")
         
         context = ""
         for i, p in enumerate(papers):
-            context += f"Paper {i+1}:\nTitle: {p['title']}\nAuthors: {p['authors']}\nSummary: {p['summary']}\n\n"
+            year = p.get('year', 'Unknown')
+            venue = p.get('venue', 'Unknown')
+            context += f"Paper ID: {p.get('id', i)}\nTitle: {p['title']}\nAuthors: {p['authors']}\nYear: {year}\nVenue: {venue}\nSummary: {p['summary']}\n\n"
 
         prompt = f"""
-        You are PeerSight, an expert AI Research Assistant assessing research novelty.
-        The user has proposed the following research idea: "{idea}"
+        You are PeerSight, an expert AI Research Assistant.
+        The user has requested research on: "{query}"
         
-        Based on the following existing literature:
+        Based on the retrieved papers below, rate each paper from 0-100 based on:
+        1. Relevance to the query.
+        2. Quality (e.g., reputable authors and venues if known).
+        3. Recency (newer papers generally score higher unless older ones are highly relevant seminal works).
+        
+        Papers:
         {context}
         
-        Evaluate the novelty of the user's idea.
-        Return a JSON response strictly exactly matching this format. Your output must start with {{ and end with }}:
-        {{
-            "score": <0-100 integer representing novelty percentage>,
-            "overlap_description": "<1-2 sentence description of what overlaps and what is novel>",
-            "closest_papers": [
-                {{"title": "<title of closest paper>", "overlap_percentage": <integer>, "reason": "<short reason>"}}
-            ]
-        }}
+        Return a JSON list of objects matching this exact format:
+        [
+            {{
+                "id": "<paper id from input>",
+                "score": <0-100 integer>,
+                "justification": "<1-2 sentence explanation of the score based on relevance, quality, and recency>"
+            }}
+        ]
         """
         
         response = model.generate_content(
@@ -115,18 +133,18 @@ def evaluate_novelty(idea: str, papers: List[Dict]) -> Dict:
                 response_mime_type="application/json"
             )
         )
-        return json.loads(response.text)
+        ratings = json.loads(response.text)
+        print(f"[SYSTEM] Successfully rated {len(ratings)} papers.")
+        return ratings
     except Exception as e:
-        return {
-            "score": 0,
-            "overlap_description": f"Error connected to Gemini: {e}",
-            "closest_papers": []
-        }
+        print(f"[ERROR] Error rating papers: {e}")
+        return []
 
-def process_chat_message(query: str, active_papers: List[Dict], chat_history: List[Dict]) -> str:
-    """Process a conversation message."""
+def process_chat_message(query: str, active_papers: List[Dict], chat_history: List[Dict], allowed_categories: List[str] = None) -> Dict:
+    """Process a conversation message and returns a structured action plan."""
+    print(f"[SYSTEM] Processing chat message. Active papers: {len(active_papers)}")
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-3-flash-preview")
         
         context = ""
         for i, p in enumerate(active_papers):
@@ -140,16 +158,42 @@ def process_chat_message(query: str, active_papers: List[Dict], chat_history: Li
         Current context papers:
         {context}
         
+        Allowed Source Categories for arXiv searches (if needed):
+        {allowed_categories if allowed_categories else []}
+        
         Recent conversation:
         {history}
         
         User's newest message: {query}
         
-        Respond clearly, briefly, and professionally. If the user asks to filter or change scope, acknowledge it and say you'll update the synthesis document.
-        Keep the response very short (1-3 sentences max).
+        Determine the best action to take:
+        1. 'reply_only': The user just wants to chat, ask a simple question, or there's no need to update the formal synthesized document or search for new papers.
+        2. 'update_synthesis': The user requested a change in formatting, scope, or focus that requires rewriting the main Synthesized Answer based on EXISTING papers.
+        3. 'search': The user is asking about new concepts, asking to expand the scope, or asking questions that require retrieving NEW papers from arXiv.
+
+        Return a JSON object that strictly matches this format:
+        {{
+            "message_to_user": "<Concise 1-3 sentence Assistant response to the user's message>",
+            "action": "reply_only", "update_synthesis", or "search",
+            "new_search_queries": ["<string, specific arxiv keyword query>", "<string>"],
+            "new_search_categories": ["<category code from allowed_categories>"]
+        }}
         """
         
-        response = model.generate_content(prompt)
-        return response.text
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json"
+            )
+        )
+        action_plan = json.loads(response.text)
+        print(f"[SYSTEM] Chat processed. Suggested action: {action_plan.get('action')}")
+        return action_plan
     except Exception as e:
-        return f"Error connecting to Gemini: {e}"
+        print(f"[ERROR] Error processing chat message: {e}")
+        return {
+            "message_to_user": f"Error connecting to Gemini: {e}",
+            "action": "reply_only",
+            "new_search_queries": [],
+            "new_search_categories": []
+        }
